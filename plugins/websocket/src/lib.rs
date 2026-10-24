@@ -4,6 +4,9 @@
 
 //! Open a WebSocket connection using a Rust client in JS.
 //!
+//! The plugin opens each connection's TCP stream itself, so the host can configure its socket
+//! ([`Builder::socket_configurer`]) and close open connections ([`close_all`], [`close_bound_to`]).
+//!
 //! ## Cargo features
 //!
 //! - **rustls-tls** *(enabled by default)*: Enables TLS functionality provided by `rustls` with WebPKI roots.
@@ -21,40 +24,53 @@
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use http::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize, ser::Serializer};
+use socket2::SockRef;
 use tauri::{
-    Manager, Runtime, State, Window,
+    AppHandle, Manager, Runtime, State, Window,
+    async_runtime::JoinHandle,
     ipc::Channel,
     plugin::{Builder as PluginBuilder, TauriPlugin},
 };
-use tokio::{net::TcpStream, sync::Mutex};
+use tokio::{net::TcpStream, sync::Mutex, task::AbortHandle};
 #[cfg(any(
     feature = "rustls-tls",
     feature = "rustls-tls-native-roots",
     feature = "native-tls"
 ))]
-use tokio_tungstenite::connect_async_tls_with_config;
+use tokio_tungstenite::client_async_tls_with_config;
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream,
+    tungstenite::{
+        Error as TungsteniteError, Message,
+        client::IntoClientRequest,
+        error::UrlError,
+        protocol::{CloseFrame as ProtocolCloseFrame, WebSocketConfig},
+    },
+};
 #[cfg(not(any(
     feature = "rustls-tls",
     feature = "rustls-tls-native-roots",
     feature = "native-tls"
 )))]
-use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream,
-    tungstenite::{
-        Message,
-        client::IntoClientRequest,
-        protocol::{CloseFrame as ProtocolCloseFrame, WebSocketConfig},
-    },
+    client_async_with_config,
+    tungstenite::{client::uri_mode, stream::Mode},
 };
 
 use std::collections::HashMap;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::sync::{Arc, PoisonError};
+
+/// Re-exported for [`Builder::socket_configurer`], whose function receives a [`socket2::SockRef`].
+pub use socket2;
 
 type Id = u32;
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WebSocketWriter = SplitSink<WebSocket, Message>;
 type Result<T> = std::result::Result<T, Error>;
+type ConfigureSocket = dyn Fn(&SockRef<'_>) -> io::Result<()> + Send + Sync;
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -77,8 +93,55 @@ impl Serialize for Error {
     }
 }
 
+/// A connection the `connect` command opened, kept until its reader receives a `Close` frame or
+/// the host closes it with [`close_all`] or [`close_bound_to`].
+struct Connection {
+    /// Shared with each `send` in flight, so a send waiting on the network holds no lock that
+    /// closing a connection needs.
+    writer: Arc<Mutex<WebSocketWriter>>,
+    local_addr: SocketAddr,
+    on_message: Channel<serde_json::Value>,
+    reader: AbortHandle,
+}
+
+impl Connection {
+    /// Ends the connection from the host: sends its frontend a `Close` message, aborts its reader
+    /// task and drops its writer. The socket closes once the aborted reader and any `send` still
+    /// in flight have released their halves of the stream.
+    fn close(self) {
+        // Dropping the last clone of a channel the frontend created sends the frontend only an
+        // end marker, which `@tauri-apps/api`'s `Channel` consumes without calling `onmessage`,
+        // so its listeners would never see the connection close. This connection holds a clone
+        // until it is dropped below, so the `Close` sent here reaches the frontend ahead of that
+        // marker.
+        match serde_json::to_value(WebSocketMessage::Close(None)) {
+            Ok(close) => {
+                let _ = self.on_message.send(close);
+            }
+            Err(e) => unreachable!("a Close without a close frame always serializes: {e}"),
+        }
+        self.reader.abort();
+    }
+}
+
 #[derive(Default)]
-struct ConnectionManager(Mutex<HashMap<Id, WebSocketWriter>>);
+struct ConnectionManager(std::sync::Mutex<HashMap<Id, Connection>>);
+
+impl ConnectionManager {
+    fn connections(&self) -> std::sync::MutexGuard<'_, HashMap<Id, Connection>> {
+        // A panic while the lock was held leaves a valid map, so keep serving it.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn writer(&self, id: Id) -> Option<Arc<Mutex<WebSocketWriter>>> {
+        self.connections()
+            .get(&id)
+            .map(|connection| Arc::clone(&connection.writer))
+    }
+}
+
+/// The function set by [`Builder::socket_configurer`], if any.
+struct SocketConfigurer(Option<Box<ConfigureSocket>>);
 
 #[cfg(any(
     feature = "rustls-tls",
@@ -168,6 +231,21 @@ async fn connect<R: Runtime>(
     config: Option<ConnectionConfig>,
 ) -> Result<Id> {
     let id = rand::random();
+    // The reader runs detached; `close_all` and `close_bound_to` abort it.
+    let _reader = open_connection(window.app_handle(), id, url, on_message, config).await?;
+    Ok(id)
+}
+
+/// Opens the connection `connect` reports as `id`: its TCP stream, its socket configured by the
+/// [`Builder::socket_configurer`] function, the WebSocket handshake over that stream, and the
+/// reader task forwarding what it receives to `on_message`, whose handle it returns.
+async fn open_connection<R: Runtime>(
+    app: &AppHandle<R>,
+    id: Id,
+    url: String,
+    on_message: Channel<serde_json::Value>,
+    config: Option<ConnectionConfig>,
+) -> Result<JoinHandle<()>> {
     let mut request = url.into_client_request()?;
 
     if let Some(headers) = config.as_ref().and_then(|c| c.headers.as_ref()) {
@@ -183,10 +261,38 @@ async fn connect<R: Runtime>(
         feature = "rustls-tls-native-roots",
         feature = "native-tls"
     ))]
-    let tls_connector = match window.try_state::<TlsConnector>() {
+    let tls_connector = match app.try_state::<TlsConnector>() {
         Some(tls_connector) => tls_connector.0.lock().await.clone(),
         None => None,
     };
+
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .ok_or(TungsteniteError::Url(UrlError::NoHostName))?;
+    // The URI keeps the brackets around an IPv6 host.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = uri
+        .port_u16()
+        .or_else(|| match uri.scheme_str() {
+            Some("wss") => Some(443),
+            Some("ws") => Some(80),
+            _ => None,
+        })
+        .ok_or(TungsteniteError::Url(UrlError::UnsupportedUrlScheme))?;
+    let stream = TcpStream::connect((host, port))
+        .await
+        .map_err(TungsteniteError::Io)?;
+    let local_addr = stream.local_addr().map_err(TungsteniteError::Io)?;
+    if let Some(configure) = app
+        .try_state::<SocketConfigurer>()
+        .and_then(|configurer| configurer.inner().0.as_deref())
+    {
+        configure(&SockRef::from(&stream)).map_err(TungsteniteError::Io)?;
+    }
 
     #[cfg(any(
         feature = "rustls-tls",
@@ -194,26 +300,39 @@ async fn connect<R: Runtime>(
         feature = "native-tls"
     ))]
     let (ws_stream, _) =
-        connect_async_tls_with_config(request, config.map(Into::into), false, tls_connector)
+        client_async_tls_with_config(request, stream, config.map(Into::into), tls_connector)
             .await?;
     #[cfg(not(any(
         feature = "rustls-tls",
         feature = "rustls-tls-native-roots",
         feature = "native-tls"
     )))]
-    let (ws_stream, _) = connect_async_with_config(request, config.map(Into::into), false).await?;
+    let (ws_stream, _) = match uri_mode(request.uri())? {
+        Mode::Plain => {
+            client_async_with_config(
+                request,
+                MaybeTlsStream::Plain(stream),
+                config.map(Into::into),
+            )
+            .await?
+        }
+        Mode::Tls => return Err(TungsteniteError::Url(UrlError::TlsFeatureNotEnabled).into()),
+    };
 
-    tauri::async_runtime::spawn(async move {
-        let (write, read) = ws_stream.split();
-        let manager = window.state::<ConnectionManager>();
-        manager.0.lock().await.insert(id, write);
+    let (write, read) = ws_stream.split();
+    let manager = app.state::<ConnectionManager>();
+    // The reader takes this lock to remove the connection on a `Close` frame, so holding it until
+    // the insert below keeps that removal after the insert.
+    let mut connections = manager.connections();
+    let reader = tauri::async_runtime::spawn({
+        let app = app.clone();
+        let on_message = on_message.clone();
         read.for_each(move |message| {
-            let window_ = window.clone();
+            let app_ = app.clone();
             let on_message_ = on_message.clone();
             async move {
                 if let Ok(Message::Close(_)) = message {
-                    let manager = window_.state::<ConnectionManager>();
-                    manager.0.lock().await.remove(&id);
+                    app_.state::<ConnectionManager>().connections().remove(&id);
                 }
 
                 let response = match message {
@@ -243,10 +362,18 @@ async fn connect<R: Runtime>(
                 let _ = on_message_.send(response);
             }
         })
-        .await;
     });
+    connections.insert(
+        id,
+        Connection {
+            writer: Arc::new(Mutex::new(write)),
+            local_addr,
+            on_message,
+            reader: reader.inner().abort_handle(),
+        },
+    );
 
-    Ok(id)
+    Ok(reader)
 }
 
 #[tauri::command]
@@ -255,8 +382,10 @@ async fn send(
     id: Id,
     message: WebSocketMessage,
 ) -> Result<()> {
-    if let Some(write) = manager.0.lock().await.get_mut(&id) {
+    if let Some(write) = manager.writer(id) {
         write
+            .lock()
+            .await
             .send(match message {
                 WebSocketMessage::Text(t) => Message::Text(t.into()),
                 WebSocketMessage::Binary(t) => Message::Binary(t.into()),
@@ -274,22 +403,55 @@ async fn send(
     }
 }
 
-/// Initializes the plugin with the default [`Builder`], i.e. without a custom TLS [`Connector`].
+/// Closes every open connection: each frontend is sent a `Close` message without a close frame,
+/// and the connection is dropped without a closing handshake. A connection is open from its
+/// `connect` until it receives a `Close` frame or the host closes it.
+pub fn close_all<R: Runtime>(app: &AppHandle<R>) {
+    close_where(app, |_| true);
+}
+
+/// Closes, as [`close_all`] does, each open connection whose socket's local IP address is one of
+/// `addresses`, such as the addresses of a network interface that went down.
+pub fn close_bound_to<R: Runtime>(app: &AppHandle<R>, addresses: &[IpAddr]) {
+    close_where(app, |connection| {
+        addresses.contains(&connection.local_addr.ip())
+    });
+}
+
+fn close_where<R: Runtime>(app: &AppHandle<R>, closes: impl Fn(&Connection) -> bool) {
+    let Some(manager) = app.try_state::<ConnectionManager>() else {
+        return;
+    };
+    let closed: Vec<Connection> = manager
+        .connections()
+        .extract_if(|_, connection| closes(connection))
+        .map(|(_, connection)| connection)
+        .collect();
+    for connection in closed {
+        connection.close();
+    }
+}
+
+/// Initializes the plugin with the default [`Builder`], i.e. without a custom TLS [`Connector`]
+/// or a socket configurer.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::default().build()
 }
 
-/// Builder for the WebSocket plugin, used to configure a custom TLS [`Connector`] before calling [`Builder::build`].
+/// Builder for the WebSocket plugin, used to configure a custom TLS [`Connector`] or a socket
+/// configurer before calling [`Builder::build`].
 #[derive(Default)]
 pub struct Builder {
     tls_connector: Option<Connector>,
+    socket_configurer: Option<Box<ConfigureSocket>>,
 }
 
 impl Builder {
-    /// Creates a new [`Builder`] with no custom TLS [`Connector`] configured.
+    /// Creates a new [`Builder`] with no custom TLS [`Connector`] and no socket configurer.
     pub fn new() -> Self {
         Self {
             tls_connector: None,
+            socket_configurer: None,
         }
     }
 
@@ -300,6 +462,18 @@ impl Builder {
     /// crypto provider as the process default if none is installed yet.
     pub fn tls_connector(mut self, connector: Connector) -> Self {
         self.tls_connector.replace(connector);
+        self
+    }
+
+    /// Sets a function that configures the socket of each connection, such as its TCP keepalive.
+    ///
+    /// It is called once per connection, after the TCP stream connects and before the TLS and
+    /// WebSocket handshakes. An error it returns fails the connection with that error.
+    pub fn socket_configurer<F>(mut self, configurer: F) -> Self
+    where
+        F: Fn(&SockRef<'_>) -> io::Result<()> + Send + Sync + 'static,
+    {
+        self.socket_configurer.replace(Box::new(configurer));
         self
     }
 
@@ -318,6 +492,7 @@ impl Builder {
                 }
 
                 app.manage(ConnectionManager::default());
+                app.manage(SocketConfigurer(self.socket_configurer));
                 #[cfg(any(
                     feature = "rustls-tls",
                     feature = "rustls-tls-native-roots",
@@ -327,5 +502,156 @@ impl Builder {
                 Ok(())
             })
             .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Builder, Channel, ConnectionManager, IpAddr, Manager, StreamExt, WebSocketMessage,
+        close_all, close_bound_to, open_connection, send,
+    };
+    use serde_json::{Value, json};
+    use std::{
+        io,
+        net::{Ipv4Addr, Ipv6Addr},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tauri::{
+        App,
+        ipc::InvokeResponseBody,
+        test::{MockRuntime, mock_builder, mock_context, noop_assets},
+    };
+    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    const WITHIN: Duration = Duration::from_secs(1);
+
+    fn app(builder: Builder) -> tauri::Result<App<MockRuntime>> {
+        mock_builder()
+            .plugin(builder.build())
+            .build(mock_context(noop_assets()))
+    }
+
+    /// Serves WebSocket connections on a local port, echoing back what each one receives.
+    async fn echo_listener() -> io::Result<String> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let url = format!("ws://{}", listener.local_addr()?);
+        tauri::async_runtime::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tauri::async_runtime::spawn(async move {
+                    if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
+                        let (write, read) = ws_stream.split();
+                        let _ = read.forward(write).await;
+                    }
+                });
+            }
+        });
+        Ok(url)
+    }
+
+    /// A channel like the one a frontend passes to `connect`, whose messages arrive on the
+    /// returned receiver.
+    fn recording_channel() -> (Channel<Value>, mpsc::UnboundedReceiver<Value>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let channel = Channel::new(move |body| {
+            let message = match body {
+                InvokeResponseBody::Json(json) => serde_json::from_str(&json)?,
+                InvokeResponseBody::Raw(_) => Value::Null,
+            };
+            let _ = sender.send(message);
+            Ok(())
+        });
+        (channel, receiver)
+    }
+
+    fn ignoring_channel() -> Channel<Value> {
+        Channel::new(|_| Ok(()))
+    }
+
+    #[test]
+    fn the_socket_configurer_runs_once_per_connect_on_the_connected_socket() -> TestResult {
+        tauri::async_runtime::block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let app = app(Builder::new().socket_configurer(move |socket| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                socket.peer_addr().map(drop)
+            }))?;
+            let url = echo_listener().await?;
+
+            open_connection(app.handle(), 1, url.clone(), ignoring_channel(), None).await?;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            open_connection(app.handle(), 2, url, ignoring_channel(), None).await?;
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_socket_configurer_error_fails_the_connect() -> TestResult {
+        tauri::async_runtime::block_on(async {
+            let app =
+                app(Builder::new()
+                    .socket_configurer(|_| Err(io::Error::other("refused by the host"))))?;
+            let url = echo_listener().await?;
+
+            let opened = open_connection(app.handle(), 1, url, ignoring_channel(), None).await;
+            assert!(opened.is_err());
+            assert!(app.state::<ConnectionManager>().connections().is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn close_all_sends_one_close_and_ends_the_reader() -> TestResult {
+        tauri::async_runtime::block_on(async {
+            let app = app(Builder::new())?;
+            let url = echo_listener().await?;
+            let (channel, mut messages) = recording_channel();
+            let reader = open_connection(app.handle(), 1, url, channel, None).await?;
+
+            send(app.state(), 1, WebSocketMessage::Text("live".into())).await?;
+            let echo = timeout(WITHIN, messages.recv()).await?;
+            assert_eq!(echo, Some(json!({"type": "Text", "data": "live"})));
+
+            close_all(app.handle());
+            let ended = timeout(WITHIN, reader).await?;
+            assert!(ended.is_err(), "the reader was aborted");
+            let mut after_close = Vec::new();
+            while let Some(message) = timeout(WITHIN, messages.recv()).await? {
+                after_close.push(message);
+            }
+            assert_eq!(after_close, [json!({"type": "Close", "data": null})]);
+            assert!(app.state::<ConnectionManager>().connections().is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn close_bound_to_closes_only_connections_from_the_given_addresses() -> TestResult {
+        tauri::async_runtime::block_on(async {
+            let app = app(Builder::new())?;
+            let url = echo_listener().await?;
+            let reader = open_connection(app.handle(), 1, url, ignoring_channel(), None).await?;
+
+            close_bound_to(app.handle(), &[IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+            assert!(
+                app.state::<ConnectionManager>()
+                    .connections()
+                    .contains_key(&1)
+            );
+
+            close_bound_to(app.handle(), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+            assert!(app.state::<ConnectionManager>().connections().is_empty());
+            let ended = timeout(WITHIN, reader).await?;
+            assert!(ended.is_err(), "the reader was aborted");
+            Ok(())
+        })
     }
 }
