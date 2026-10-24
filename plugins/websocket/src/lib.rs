@@ -93,11 +93,14 @@ impl Serialize for Error {
     }
 }
 
-/// A connection the `connect` command opened, kept until its reader receives a `Close` frame or
-/// the host closes it with [`close_all`] or [`close_bound_to`].
+/// A connection the `connect` command opened. It is open, and kept in the `ConnectionManager`,
+/// until the first of: its reader receives a `Close` frame, its stream ends on an error or at
+/// EOF, or the host closes it with [`close_all`] or [`close_bound_to`]. The sites that remove it
+/// are the hits of `git grep -nE 'remove\(&id\)|extract_if\(' -- plugins/websocket/src/lib.rs`.
 struct Connection {
-    /// Shared with each `send` in flight, so a send waiting on the network holds no lock that
-    /// closing a connection needs.
+    /// Shared with each `send` in flight. Interior mutability authorized by ctm (mb2-doc#2179 R9,
+    /// 2026-10-24): a send awaiting the network must hold no lock that closing the connection
+    /// needs.
     writer: Arc<Mutex<WebSocketWriter>>,
     local_addr: SocketAddr,
     on_message: Channel<serde_json::Value>,
@@ -109,11 +112,15 @@ impl Connection {
     /// task and drops its writer. The socket closes once the aborted reader and any `send` still
     /// in flight have released their halves of the stream.
     fn close(self) {
-        // Dropping the last clone of a channel the frontend created sends the frontend only an
-        // end marker, which `@tauri-apps/api`'s `Channel` consumes without calling `onmessage`,
-        // so its listeners would never see the connection close. This connection holds a clone
-        // until it is dropped below, so the `Close` sent here reaches the frontend ahead of that
-        // marker.
+        // On desktop, dropping the last clone of a channel the frontend created sends the
+        // frontend only an end marker, which `@tauri-apps/api`'s `Channel` consumes without
+        // calling `onmessage`, so its listeners would never see the connection close. This
+        // connection holds a clone until it is dropped below, so the `Close` sent here reaches
+        // the frontend ahead of that marker. On iOS and Android no end marker is ever sent:
+        // tauri 2.12's `Channel::new_with_id` (`src/ipc/channel.rs`) passes a clone of every
+        // channel to `register_channel` (`src/plugin/mobile.rs`), which stores it in the static
+        // `CHANNELS` map, whose only other uses are lookups, so the last clone is never dropped
+        // and this `Close` is the only close signal the frontend gets.
         match serde_json::to_value(WebSocketMessage::Close(None)) {
             Ok(close) => {
                 let _ = self.on_message.send(close);
@@ -124,6 +131,8 @@ impl Connection {
     }
 }
 
+/// The open connections, by id. Its `std::sync::Mutex` is interior mutability covered by the
+/// same ruling as `Connection::writer` (mb2-doc#2179 R9, 2026-10-24).
 #[derive(Default)]
 struct ConnectionManager(std::sync::Mutex<HashMap<Id, Connection>>);
 
@@ -321,13 +330,14 @@ async fn open_connection<R: Runtime>(
 
     let (write, read) = ws_stream.split();
     let manager = app.state::<ConnectionManager>();
-    // The reader takes this lock to remove the connection on a `Close` frame, so holding it until
-    // the insert below keeps that removal after the insert.
+    // The reader takes this lock to remove the connection, so holding it until the insert below
+    // keeps each of its removals after the insert.
     let mut connections = manager.connections();
     let reader = tauri::async_runtime::spawn({
         let app = app.clone();
         let on_message = on_message.clone();
-        read.for_each(move |message| {
+        let exit_app = app.clone();
+        let forwarding = read.for_each(move |message| {
             let app_ = app.clone();
             let on_message_ = on_message.clone();
             async move {
@@ -361,7 +371,14 @@ async fn open_connection<R: Runtime>(
 
                 let _ = on_message_.send(response);
             }
-        })
+        });
+        async move {
+            forwarding.await;
+            exit_app
+                .state::<ConnectionManager>()
+                .connections()
+                .remove(&id);
+        }
     });
     connections.insert(
         id,
@@ -403,33 +420,36 @@ async fn send(
     }
 }
 
-/// Closes every open connection: each frontend is sent a `Close` message without a close frame,
-/// and the connection is dropped without a closing handshake. A connection is open from its
-/// `connect` until it receives a `Close` frame or the host closes it.
-pub fn close_all<R: Runtime>(app: &AppHandle<R>) {
-    close_where(app, |_| true);
+/// Closes every open connection, open as `Connection`'s doc defines it, and returns how many it
+/// closed. Each one's frontend is sent a `Close` message without a close frame, and the
+/// connection is dropped without a closing handshake.
+pub fn close_all<R: Runtime>(app: &AppHandle<R>) -> usize {
+    close_where(app, |_| true)
 }
 
 /// Closes, as [`close_all`] does, each open connection whose socket's local IP address is one of
-/// `addresses`, such as the addresses of a network interface that went down.
-pub fn close_bound_to<R: Runtime>(app: &AppHandle<R>, addresses: &[IpAddr]) {
+/// `addresses`, such as the addresses of a network interface that went down, and returns how many
+/// it closed.
+pub fn close_bound_to<R: Runtime>(app: &AppHandle<R>, addresses: &[IpAddr]) -> usize {
     close_where(app, |connection| {
         addresses.contains(&connection.local_addr.ip())
-    });
+    })
 }
 
-fn close_where<R: Runtime>(app: &AppHandle<R>, closes: impl Fn(&Connection) -> bool) {
+fn close_where<R: Runtime>(app: &AppHandle<R>, closes: impl Fn(&Connection) -> bool) -> usize {
     let Some(manager) = app.try_state::<ConnectionManager>() else {
-        return;
+        return 0;
     };
     let closed: Vec<Connection> = manager
         .connections()
         .extract_if(|_, connection| closes(connection))
         .map(|(_, connection)| connection)
         .collect();
+    let count = closed.len();
     for connection in closed {
         connection.close();
     }
+    count
 }
 
 /// Initializes the plugin with the default [`Builder`], i.e. without a custom TLS [`Connector`]
@@ -508,8 +528,9 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::{
-        Builder, Channel, ConnectionManager, IpAddr, Manager, StreamExt, WebSocketMessage,
-        close_all, close_bound_to, open_connection, send,
+        Builder, Channel, ConnectionManager, IpAddr, Manager, Message, SinkExt, StreamExt,
+        TcpStream, WebSocketMessage, WebSocketStream, close_all, close_bound_to, open_connection,
+        send,
     };
     use serde_json::{Value, json};
     use std::{
@@ -526,7 +547,11 @@ mod tests {
         ipc::InvokeResponseBody,
         test::{MockRuntime, mock_builder, mock_context, noop_assets},
     };
-    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, oneshot},
+        time::timeout,
+    };
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -550,6 +575,24 @@ mod tests {
                         let _ = read.forward(write).await;
                     }
                 });
+            }
+        });
+        Ok(url)
+    }
+
+    /// Accepts one WebSocket connection on a local port and hands it to `serve`.
+    async fn serve_once<F, Fut>(serve: F) -> io::Result<String>
+    where
+        F: FnOnce(WebSocketStream<TcpStream>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let url = format!("ws://{}", listener.local_addr()?);
+        tauri::async_runtime::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await
+                && let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await
+            {
+                serve(ws_stream).await;
             }
         });
         Ok(url)
@@ -620,7 +663,7 @@ mod tests {
             let echo = timeout(WITHIN, messages.recv()).await?;
             assert_eq!(echo, Some(json!({"type": "Text", "data": "live"})));
 
-            close_all(app.handle());
+            assert_eq!(close_all(app.handle()), 1);
             let ended = timeout(WITHIN, reader).await?;
             assert!(ended.is_err(), "the reader was aborted");
             let mut after_close = Vec::new();
@@ -640,17 +683,75 @@ mod tests {
             let url = echo_listener().await?;
             let reader = open_connection(app.handle(), 1, url, ignoring_channel(), None).await?;
 
-            close_bound_to(app.handle(), &[IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+            assert_eq!(
+                close_bound_to(app.handle(), &[IpAddr::V6(Ipv6Addr::LOCALHOST)]),
+                0
+            );
             assert!(
                 app.state::<ConnectionManager>()
                     .connections()
                     .contains_key(&1)
             );
 
-            close_bound_to(app.handle(), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+            assert_eq!(
+                close_bound_to(app.handle(), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+                1
+            );
             assert!(app.state::<ConnectionManager>().connections().is_empty());
             let ended = timeout(WITHIN, reader).await?;
             assert!(ended.is_err(), "the reader was aborted");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_stream_ending_on_an_error_removes_its_connection() -> TestResult {
+        tauri::async_runtime::block_on(async {
+            let app = app(Builder::new())?;
+            // Dropping the connection without a closing handshake ends the client's stream on an
+            // error.
+            let url = serve_once(|ws_stream| async move { drop(ws_stream) }).await?;
+            let (channel, mut messages) = recording_channel();
+            let reader = open_connection(app.handle(), 1, url, channel, None).await?;
+
+            timeout(WITHIN, reader).await??;
+            assert!(
+                !app.state::<ConnectionManager>()
+                    .connections()
+                    .contains_key(&1)
+            );
+            let error = timeout(WITHIN, messages.recv()).await?;
+            assert!(matches!(error, Some(Value::String(_))), "{error:?}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_close_frame_removes_its_connection_while_its_stream_is_open() -> TestResult {
+        tauri::async_runtime::block_on(async {
+            let app = app(Builder::new())?;
+            let (release, released) = oneshot::channel::<()>();
+            // Sends a `Close` frame, then holds the connection open, unread, until released.
+            let url = serve_once(|mut ws_stream| async move {
+                if ws_stream.send(Message::Close(None)).await.is_ok() {
+                    let _ = released.await;
+                }
+            })
+            .await?;
+            let (channel, mut messages) = recording_channel();
+            let reader = open_connection(app.handle(), 1, url, channel, None).await?;
+
+            let close = timeout(WITHIN, messages.recv()).await?;
+            assert_eq!(close, Some(json!({"type": "Close", "data": null})));
+            assert!(
+                !app.state::<ConnectionManager>()
+                    .connections()
+                    .contains_key(&1)
+            );
+            assert!(!reader.inner().is_finished(), "the stream is still open");
+
+            drop(release);
+            timeout(WITHIN, reader).await??;
             Ok(())
         })
     }
